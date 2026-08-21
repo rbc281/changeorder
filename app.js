@@ -508,11 +508,9 @@
       page.drawImage(png, { x: r.x + (r.width - w)/2, y: r.y + (r.height - h)/2, width: w, height: h });
     }
 
-    // Signature widgets are intentionally removed; management remains blank.
-    [PDF_FIELDS.signature1, PDF_FIELDS.signature2, PDF_FIELDS.managementSignature].forEach(name => {
-      try { form.removeField(form.getField(name)); } catch (_) {}
-    });
-
+    // The template has the three empty PDF signature widgets removed.
+    // Handwritten customer signatures are drawn directly onto the page above,
+    // and the management signature line intentionally remains blank.
     form.updateFieldAppearances(font);
     form.flatten();
     return await pdfDoc.save();
