@@ -1,11 +1,11 @@
-const CACHE = "changeorder-v1";
+const CACHE = "changeorder-v2";
 const LOCAL_ASSETS = [
   "./",
   "./index.html",
   "./styles.css",
   "./app.js",
   "./manifest.webmanifest",
-  "./assets/change-order-template.pdf"
+  "./change-order-template.pdf"
 ];
 self.addEventListener("install", event => {
   event.waitUntil(caches.open(CACHE).then(cache => cache.addAll(LOCAL_ASSETS)));
