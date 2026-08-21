@@ -1,7 +1,7 @@
 (() => {
   "use strict";
 
-  const TEMPLATE_PATH = "change-order-template.pdf";
+  const TEMPLATE_PATH = "./change-order-template.pdf";
   const MAX_CHANGES = 10;
   const TODAY = new Date();
 
