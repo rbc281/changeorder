@@ -1,11 +1,11 @@
-const CACHE = "changeorder-complete-v1";
+const CACHE = "changeorder-v3-20260922";
 const LOCAL_ASSETS = [
   "./",
   "./index.html",
   "./styles.css",
   "./app.js",
   "./manifest.webmanifest",
-  "./change-order-template.pdf",
+  "./change-order-template.png",
   "./blank-change-order-fillable.pdf"
 ];
 
@@ -41,3 +41,4 @@ self.addEventListener("fetch", event => {
       .catch(() => caches.match(event.request))
   );
 });
+

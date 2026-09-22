@@ -8,8 +8,8 @@
   <meta name="apple-mobile-web-app-status-bar-style" content="default" />
   <meta name="apple-mobile-web-app-title" content="Change Order" />
   <title>Change Order Generator</title>
-  <link rel="manifest" href="manifest.webmanifest?v=20260820complete1" />
-  <link rel="stylesheet" href="styles.css?v=20260820complete1" />
+  <link rel="manifest" href="manifest.webmanifest?v=20260922v3" />
+  <link rel="stylesheet" href="styles.css?v=20260922v3" />
 </head>
 <body>
   <header class="topbar">
@@ -20,7 +20,10 @@
         <div class="brand-sub">Renewal by Andersen GLA</div>
       </div>
     </div>
-    <div class="status-pill" id="saveStatus">Ready</div>
+    <div class="topbar-actions">
+      <div class="status-pill" id="saveStatus">Ready</div>
+      <button id="clearTopBtn" class="button clear-button top-clear" type="button">Clear Data</button>
+    </div>
   </header>
 
   <main class="shell">
@@ -28,7 +31,7 @@
       <h1>Change Order Generator</h1>
       <p class="hero-intro">Enter only the information the form needs. Pricing and payment calculations are handled automatically.</p>
       <p class="hero-disclaimer"><strong>Disclaimer:</strong> this is a resource tool meant to assist you. You are still responsible for checking the accuracy of the descriptions and payment schedule.</p>
-      <p class="hero-download">Need a blank change order form? <a href="blank-change-order-fillable.pdf?v=20260820complete1" download="Blank Change Order.pdf">Click here</a></p>
+      <p class="hero-download">Need a blank change order form? <a href="blank-change-order-fillable.pdf?v=20260922v3" download="Blank Change Order.pdf">Click here</a></p>
     </section>
 
     <form id="changeOrderForm" novalidate>
@@ -89,7 +92,7 @@
           <div class="step">2</div>
           <div>
             <h2>Project Changes</h2>
-            <p>Tell us exactly what is changing. Add up to 10 line items.</p>
+            <p>Describe exactly what's changing. Add up to 5 line items. Anything more than 5 line items or 10% change in price requires a new contract change order</p>
           </div>
         </div>
 
@@ -153,7 +156,7 @@
 
         <div id="financeFields" class="finance-fields hidden">
           <div class="divider-label">Finance Details</div>
-          <div class="grid two-col">
+          <div class="grid">
             <div class="field">
               <label for="financeProgram">Finance Program <span class="req">Required</span></label>
               <p class="helper">Select the finance program used in rFinance.</p>
@@ -166,12 +169,6 @@
                 <option value="R418006|6.99% - 15 Years">6.99% - 15 Years</option>
                 <option value="R418009|9.99% - 15 Years">9.99% - 15 Years</option>
               </select>
-            </div>
-
-            <div class="field">
-              <label for="financePlan">Finance Plan # / Application ID <span class="req">Required</span></label>
-              <p class="helper">Use the Application ID # from rFinance.</p>
-              <input id="financePlan" name="financePlan" type="text" maxlength="60" placeholder="Application ID #" />
             </div>
           </div>
         </div>
@@ -217,6 +214,7 @@
 
       <div id="formError" class="form-error hidden" role="alert"></div>
       <div class="action-bar">
+        <button id="clearBottomBtn" class="button clear-button" type="button">Clear Data</button>
         <button id="reviewBtn" class="button primary" type="button">Review Change Order</button>
       </div>
     </form>
@@ -233,21 +231,36 @@
     <div id="reviewContent" class="review-content"></div>
     <div class="dialog-actions">
       <button id="editBtn" class="button secondary" type="button">Make Changes</button>
-      <button id="generateBtn" class="button primary" type="button">Generate PDF</button>
+      <button id="viewBtn" class="button primary" type="button">View Change Order</button>
     </div>
   </dialog>
 
-  <dialog id="successDialog" class="review-dialog success-dialog">
-    <div class="success-icon">✓</div>
-    <h2>Change Order Generated</h2>
-    <p>Your completed PDF has been created using the original Change Order form.</p>
-    <div class="dialog-actions stack-mobile">
-      <button id="downloadAgainBtn" class="button primary" type="button">Download PDF Again</button>
-      <button id="newOrderBtn" class="button secondary" type="button">Start New Change Order</button>
+  <dialog id="previewDialog" class="preview-dialog">
+    <div class="preview-head">
+      <div>
+        <p class="eyebrow">Completed Change Order</p>
+        <h2>View Change Order</h2>
+      </div>
+      <button id="closePreviewBtn" class="dialog-close" type="button" aria-label="Close preview">×</button>
+    </div>
+    <div class="preview-toolbar" aria-label="Preview controls">
+      <button id="zoomOutBtn" class="button secondary compact" type="button" aria-label="Zoom out">−</button>
+      <span id="zoomLabel" class="zoom-label">Fit</span>
+      <button id="zoomInBtn" class="button secondary compact" type="button" aria-label="Zoom in">+</button>
+      <button id="fitPreviewBtn" class="button secondary compact" type="button">Fit Page</button>
+    </div>
+    <div id="previewViewport" class="preview-viewport">
+      <canvas id="changeOrderPreview" width="2550" height="3300" aria-label="Completed Change Order preview"></canvas>
+    </div>
+    <p class="preview-tip">Pinch or use the zoom controls to inspect the form. The downloaded PDF uses this exact rendered image.</p>
+    <div class="dialog-actions">
+      <button id="backToReviewBtn" class="button secondary" type="button">Back to Review</button>
+      <button id="downloadPdfBtn" class="button primary" type="button">Download PDF</button>
     </div>
   </dialog>
 
   <script src="https://unpkg.com/pdf-lib@1.17.1/dist/pdf-lib.min.js"></script>
-  <script src="app.js?v=20260820complete1"></script>
+  <script src="app.js?v=20260922v3"></script>
 </body>
 </html>
+

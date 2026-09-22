@@ -1,14 +1,18 @@
 (() => {
   "use strict";
 
-  const BUILD_VERSION = "20260820complete1";
-  const TEMPLATE_PATH = `./change-order-template.pdf?v=${BUILD_VERSION}`;
-  const MAX_CHANGES = 10;
+  const BUILD_VERSION = "20260922v3";
+  const TEMPLATE_IMAGE_PATH = `./change-order-template.png?v=${BUILD_VERSION}`;
+  const MAX_CHANGES = 5;
+  const MASTER_WIDTH = 2550;
+  const MASTER_HEIGHT = 3300;
+  const PDF_WIDTH = 612;
+  const PDF_HEIGHT = 792;
+  const CANVAS_SCALE = MASTER_WIDTH / PDF_WIDTH;
   const TODAY = new Date();
 
-  // Fixed rectangles from the supplied 2026 Change Order PDF.
-  // V5 draws directly onto the page instead of filling AcroForm fields.
-  // This avoids malformed /DA and signature appearance metadata in the source PDF.
+  // Coordinates are measured in PDF points on the original Letter-size form
+  // and converted to the 300 DPI canvas at render time.
   const PDF_BOXES = {
     contractDate: [121, 654, 221, 669],
     orderNumber: [274, 654, 394, 669],
@@ -32,23 +36,17 @@
     changeAmount: [439, 215, 546, 229],
     newPrice: [439, 198, 546, 212],
     customer1Date: [404, 168, 551, 182],
-    customer2Date: [404, 139, 551, 153],
-    managementDate: [404, 112, 551, 126],
+    customer2Date: [404, 139, 551, 153]
   };
+
   PDF_BOXES.changeRows = [
     [[47, 518, 105, 532], [107, 518, 227, 532], [230, 518, 543, 532]],
     [[48, 501, 105, 515], [107, 501, 226, 515], [230, 502, 542, 516]],
     [[47, 485, 104, 499], [107, 486, 227, 500], [230, 485, 542, 499]],
     [[47, 468, 105, 482], [108, 470, 227, 484], [229, 469, 542, 483]],
-    [[48, 453, 104, 467], [107, 452, 226, 466], [229, 452, 542, 466]],
-    [[47, 437, 104, 451], [108, 437, 227, 451], [229, 437, 542, 451]],
-    [[48, 421, 105, 435], [108, 420, 228, 434], [229, 420, 542, 434]],
-    [[47, 404, 105, 418], [107, 404, 226, 418], [229, 404, 542, 418]],
-    [[48, 387, 105, 401], [108, 388, 227, 402], [230, 388, 543, 402]],
-    [[48, 371, 106, 385], [108, 371, 228, 385], [229, 372, 542, 386]],
+    [[48, 453, 104, 467], [107, 452, 226, 466], [229, 452, 542, 466]]
   ].map(([unit, room, change]) => ({ unit, room, change }));
 
-  // Widget rectangles in PDF points, used only to place optional handwritten signatures.
   const SIGNATURE_RECTS = {
     signature1: { x: 165, y: 167, width: 172, height: 20 },
     signature2: { x: 165, y: 139, width: 172, height: 20 }
@@ -60,25 +58,34 @@
   const financeFields = $("financeFields");
   const oopMethodWrap = $("oopMethodWrap");
   const reviewDialog = $("reviewDialog");
-  const successDialog = $("successDialog");
+  const previewDialog = $("previewDialog");
+  const previewCanvas = $("changeOrderPreview");
+  const previewViewport = $("previewViewport");
   const formError = $("formError");
 
   let changes = [];
-  let lastGeneratedBlob = null;
-  let lastGeneratedFilename = "Change Order.pdf";
-  let isGenerating = false;
+  let templateImagePromise = null;
+  let renderedData = null;
+  let previewScale = 1;
+  let isRendering = false;
+  let isDownloading = false;
 
   function pad2(n) { return String(n).padStart(2, "0"); }
-  function dateForInput(d) { return `${d.getFullYear()}-${pad2(d.getMonth()+1)}-${pad2(d.getDate())}`; }
+
   function dateForPdf(inputValue) {
     if (!inputValue) return "";
-    const [y,m,d] = inputValue.split("-");
-    return `${m}/${d}/${y}`;
+    const [year, month, day] = inputValue.split("-");
+    return `${month}/${day}/${year}`;
   }
-  function todayForPdf() { return `${pad2(TODAY.getMonth()+1)}/${pad2(TODAY.getDate())}/${TODAY.getFullYear()}`; }
+
+  function todayForPdf() {
+    return `${pad2(TODAY.getMonth() + 1)}/${pad2(TODAY.getDate())}/${TODAY.getFullYear()}`;
+  }
 
   function escapeHtml(value) {
-    return String(value ?? "").replace(/[&<>'"]/g, c => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", "'":"&#39;", '"':"&quot;" }[c]));
+    return String(value ?? "").replace(/[&<>'"]/g, (character) => ({
+      "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;"
+    }[character]));
   }
 
   function parseMoneyToCents(value) {
@@ -89,11 +96,9 @@
     const negative = raw.startsWith("-");
     if (negative) raw = raw.slice(1);
     const parts = raw.split(".");
-    let whole = (parts[0] || "0").replace(/[^\d]/g, "");
-    let decimal = (parts[1] || "").replace(/[^\d]/g, "");
-    const dollars = parseInt(whole || "0", 10);
-    const cents = parseInt((decimal + "00").slice(0, 2), 10);
-    const total = dollars * 100 + cents;
+    const whole = (parts[0] || "0").replace(/[^\d]/g, "");
+    const decimal = (parts[1] || "").replace(/[^\d]/g, "");
+    const total = parseInt(whole || "0", 10) * 100 + parseInt((decimal + "00").slice(0, 2), 10);
     return negative ? -total : total;
   }
 
@@ -107,41 +112,30 @@
     return `${sign}$${dollars}.${centPart}`;
   }
 
-  // Mirrors the current PAF Calculator logic exactly:
-  // deposit <= min(10% of project, $1,000); 33% total due through progress;
-  // remaining balance at installation; out-of-pocket is applied sequentially first.
+  // Preserve the current PAF rules: deposit <= min(10%, $1,000), 33% due
+  // through progress, remainder at installation, out-of-pocket allocated first.
   function calculatePaymentSchedule(projectTotal, outOfPocket, method) {
     projectTotal = Math.max(0, Math.trunc(projectTotal || 0));
     outOfPocket = Math.max(0, Math.min(Math.trunc(outOfPocket || 0), projectTotal));
-
     const amountFinanced = projectTotal - outOfPocket;
-    const initialDepositLimit = Math.min(Math.trunc(projectTotal * 10 / 100), 100000);
-    const payment1 = outOfPocket > 0 ? Math.min(outOfPocket, initialDepositLimit) : 0;
-    const requiredDepositTotal = Math.trunc(projectTotal * 33 / 100);
-    const payment2 = Math.max(requiredDepositTotal - payment1, 0);
+    const payment1 = outOfPocket > 0 ? Math.min(outOfPocket, Math.min(Math.trunc(projectTotal * 10 / 100), 100000)) : 0;
+    const payment2 = Math.max(Math.trunc(projectTotal * 33 / 100) - payment1, 0);
     const payment3 = projectTotal - payment1 - payment2;
-
     let remainingOop = outOfPocket;
     const oop1 = Math.min(remainingOop, payment1); remainingOop -= oop1;
     const oop2 = Math.min(remainingOop, payment2); remainingOop -= oop2;
-    const oop3 = Math.min(remainingOop, payment3); remainingOop -= oop3;
-
-    const fin1 = payment1 - oop1;
-    const fin2 = payment2 - oop2;
-    const fin3 = payment3 - oop3;
-
-    const allocation = (oop, fin, total) => ({
+    const oop3 = Math.min(remainingOop, payment3);
+    const allocation = (oop, finance, total) => ({
       check: method === "check" ? oop : 0,
       credit: method === "credit" ? oop : 0,
-      finance: fin,
+      finance,
       total
     });
-
     return {
       amountFinanced,
-      deposit: allocation(oop1, fin1, payment1),
-      progress: allocation(oop2, fin2, payment2),
-      installation: allocation(oop3, fin3, payment3)
+      deposit: allocation(oop1, payment1 - oop1, payment1),
+      progress: allocation(oop2, payment2 - oop2, payment2),
+      installation: allocation(oop3, payment3 - oop3, payment3)
     };
   }
 
@@ -164,14 +158,8 @@
           ${changes.length > 1 ? `<button class="remove-change" type="button" data-remove-change="${item.id}">Remove</button>` : ""}
         </div>
         <div class="change-fields">
-          <div>
-            <label>Unit # <span class="req">Required</span></label>
-            <input data-change-field="unit" maxlength="12" value="${escapeHtml(item.unit)}" placeholder="e.g. 3" required />
-          </div>
-          <div>
-            <label>Room / Description <span class="req">Required</span></label>
-            <input data-change-field="room" maxlength="32" value="${escapeHtml(item.room)}" placeholder="e.g. Living Room" required />
-          </div>
+          <div><label>Unit # <span class="req">Required</span></label><input data-change-field="unit" maxlength="12" value="${escapeHtml(item.unit)}" placeholder="e.g. 3" required /></div>
+          <div><label>Room / Description <span class="req">Required</span></label><input data-change-field="room" maxlength="32" value="${escapeHtml(item.room)}" placeholder="e.g. Living Room" required /></div>
           <div class="change-description">
             <label>What is changing? <span class="req">Required</span></label>
             <input data-change-field="change" maxlength="110" value="${escapeHtml(item.change)}" placeholder="Describe the revision" required />
@@ -180,15 +168,14 @@
         </div>
       </div>
     `).join("");
-
     $("addChangeBtn").disabled = changes.length >= MAX_CHANGES;
-    $("addChangeBtn").textContent = changes.length >= MAX_CHANGES ? "Maximum of 10 Changes Reached" : "+ Add Another Change";
+    $("addChangeBtn").textContent = changes.length >= MAX_CHANGES ? "Maximum of 5 Changes Reached" : "+ Add Another Change";
   }
 
   function syncChangeInput(target) {
     const itemEl = target.closest(".change-item");
     if (!itemEl) return;
-    const item = changes.find(c => c.id === itemEl.dataset.changeId);
+    const item = changes.find((change) => change.id === itemEl.dataset.changeId);
     if (!item) return;
     const field = target.dataset.changeField;
     if (field) item[field] = target.value;
@@ -198,7 +185,7 @@
 
   function removeChange(id) {
     if (changes.length <= 1) return;
-    changes = changes.filter(c => c.id !== id);
+    changes = changes.filter((change) => change.id !== id);
     renderChanges();
   }
 
@@ -212,93 +199,68 @@
     const outOfPocket = parseMoneyToCents($("outOfPocket").value);
     const changeAmount = projectTotal - previous;
     const method = selectedOopMethod();
-
     const changeEl = $("changeAmountDisplay");
     changeEl.textContent = money(changeAmount, true);
     changeEl.classList.toggle("positive", changeAmount > 0);
     changeEl.classList.toggle("negative", changeAmount < 0);
-
-    // A blank out-of-pocket field means $0 out of pocket / fully financed.
     const financingNeeded = projectTotal > 0 && outOfPocket < projectTotal;
     financeFields.classList.toggle("hidden", !financingNeeded);
     $("financeProgram").required = financingNeeded;
-    $("financePlan").required = financingNeeded;
-
     const oopMethodNeeded = outOfPocket > 0;
     oopMethodWrap.classList.toggle("hidden", !oopMethodNeeded);
-    document.querySelectorAll('input[name="oopMethod"]').forEach(r => r.required = oopMethodNeeded);
-
+    document.querySelectorAll('input[name="oopMethod"]').forEach((radio) => { radio.required = oopMethodNeeded; });
     const calc = calculatePaymentSchedule(projectTotal, outOfPocket, method);
-    const rows = [
-      ["dep", calc.deposit],
-      ["prog", calc.progress],
-      ["inst", calc.installation]
-    ];
-    rows.forEach(([prefix, row]) => {
+    [["dep", calc.deposit], ["prog", calc.progress], ["inst", calc.installation]].forEach(([prefix, row]) => {
       $(`${prefix}Check`).textContent = money(row.check);
       $(`${prefix}Credit`).textContent = money(row.credit);
       $(`${prefix}Finance`).textContent = money(row.finance);
       $(`${prefix}Total`).textContent = money(row.total);
     });
     $("financeSummary").textContent = `Amount financed: ${money(calc.amountFinanced)}`;
-
-    // Signature 2 is only useful when a second customer is named.
     $("signature2Card").classList.toggle("hidden", !$("customer2").value.trim());
   }
 
-  function markInvalid(el, invalid) {
-    if (!el) return;
-    el.classList.toggle("invalid", !!invalid);
+  function markInvalid(element, invalid) {
+    if (element) element.classList.toggle("invalid", Boolean(invalid));
   }
 
   function validateForm() {
-    document.querySelectorAll(".invalid").forEach(el => el.classList.remove("invalid"));
+    document.querySelectorAll(".invalid").forEach((element) => element.classList.remove("invalid"));
     formError.classList.add("hidden");
     const errors = [];
-
-    const requiredIds = ["contractDate", "orderNumber", "consultant", "customer1", "installAddress", "previousPrice", "newPrice"];
-    requiredIds.forEach(id => {
-      const el = $(id);
-      if (!String(el.value || "").trim()) {
-        markInvalid(el, true);
-        errors.push(`${el.closest(".field")?.querySelector("label")?.childNodes[0]?.textContent?.trim() || id} is required.`);
+    ["contractDate", "orderNumber", "consultant", "customer1", "installAddress", "previousPrice", "newPrice"].forEach((id) => {
+      const element = $(id);
+      if (!String(element.value || "").trim()) {
+        markInvalid(element, true);
+        errors.push(`${element.closest(".field")?.querySelector("label")?.childNodes[0]?.textContent?.trim() || id} is required.`);
       }
     });
-
     changes.forEach((change, index) => {
       const itemEl = changesList.querySelector(`[data-change-id="${change.id}"]`);
-      ["unit", "room", "change"].forEach(field => {
+      ["unit", "room", "change"].forEach((field) => {
         if (!String(change[field] || "").trim()) {
-          const input = itemEl?.querySelector(`[data-change-field="${field}"]`);
-          markInvalid(input, true);
+          markInvalid(itemEl?.querySelector(`[data-change-field="${field}"]`), true);
           errors.push(`Change #${index + 1} is incomplete.`);
         }
       });
     });
-
     const previous = parseMoneyToCents($("previousPrice").value);
     const newPrice = parseMoneyToCents($("newPrice").value);
-    const oop = parseMoneyToCents($("outOfPocket").value);
-
+    const outOfPocket = parseMoneyToCents($("outOfPocket").value);
     if (previous <= 0) { markInvalid($("previousPrice"), true); errors.push("Previous Project Price must be greater than $0."); }
     if (newPrice <= 0) { markInvalid($("newPrice"), true); errors.push("New Project Price must be greater than $0."); }
-    if (oop < 0) { markInvalid($("outOfPocket"), true); errors.push("Out-of-pocket amount cannot be negative."); }
-    if (newPrice > 0 && oop > newPrice) { markInvalid($("outOfPocket"), true); errors.push("Out-of-pocket amount cannot exceed the New Project Price."); }
-
-    if (oop > 0 && !selectedOopMethod()) errors.push("Select Check or Credit Card for the out-of-pocket payment method.");
-
-    const financingNeeded = newPrice > 0 && oop < newPrice;
-    if (financingNeeded) {
-      if (!$("financeProgram").value) { markInvalid($("financeProgram"), true); errors.push("Finance Program is required when financing is used."); }
-      if (!$("financePlan").value.trim()) { markInvalid($("financePlan"), true); errors.push("Finance Plan # / Application ID is required when financing is used."); }
+    if (outOfPocket < 0) { markInvalid($("outOfPocket"), true); errors.push("Out-of-pocket amount cannot be negative."); }
+    if (newPrice > 0 && outOfPocket > newPrice) { markInvalid($("outOfPocket"), true); errors.push("Out-of-pocket amount cannot exceed the New Project Price."); }
+    if (outOfPocket > 0 && !selectedOopMethod()) errors.push("Select Check or Credit Card for the out-of-pocket payment method.");
+    if (newPrice > 0 && outOfPocket < newPrice && !$("financeProgram").value) {
+      markInvalid($("financeProgram"), true);
+      errors.push("Finance Program is required when financing is used.");
     }
-
     if (errors.length) {
       const unique = [...new Set(errors)];
       formError.textContent = unique[0] + (unique.length > 1 ? ` Plus ${unique.length - 1} more item${unique.length > 2 ? "s" : ""} to complete.` : "");
       formError.classList.remove("hidden");
-      const firstInvalid = document.querySelector(".invalid") || formError;
-      firstInvalid.scrollIntoView({ behavior: "smooth", block: "center" });
+      (document.querySelector(".invalid") || formError).scrollIntoView({ behavior: "smooth", block: "center" });
       return false;
     }
     return true;
@@ -309,7 +271,6 @@
     const newPrice = parseMoneyToCents($("newPrice").value);
     const outOfPocket = parseMoneyToCents($("outOfPocket").value);
     const method = selectedOopMethod();
-    const schedule = calculatePaymentSchedule(newPrice, outOfPocket, method);
     const selectedFinance = $("financeProgram").value ? $("financeProgram").value.split("|") : ["", ""];
     return {
       contractDate: $("contractDate").value,
@@ -319,16 +280,15 @@
       customer1: $("customer1").value.trim(),
       customer2: $("customer2").value.trim(),
       installAddress: $("installAddress").value.trim(),
-      changes: changes.map(c => ({ unit: c.unit.trim(), room: c.room.trim(), change: c.change.trim() })),
+      changes: changes.map((change) => ({ unit: change.unit.trim(), room: change.room.trim(), change: change.change.trim() })),
       previousPrice: previous,
       newPrice,
       changeAmount: newPrice - previous,
       outOfPocket,
       oopMethod: method,
-      schedule,
+      schedule: calculatePaymentSchedule(newPrice, outOfPocket, method),
       financeCode: selectedFinance[0] || "",
       financeLabel: selectedFinance[1] || "",
-      financePlan: $("financePlan").value.trim(),
       signature1: !isCanvasBlank($("signature1")),
       signature2: $("customer2").value.trim() ? !isCanvasBlank($("signature2")) : false
     };
@@ -336,191 +296,231 @@
 
   function renderReview(data) {
     const financeText = data.schedule.amountFinanced > 0
-      ? `${escapeHtml(data.financeLabel)} (${escapeHtml(data.financeCode)}) - Application ID: ${escapeHtml(data.financePlan)}`
+      ? `${escapeHtml(data.financeLabel)} (Finance Plan # ${escapeHtml(data.financeCode)})`
       : "No financing";
-    const signatureText = [data.signature1 ? "Customer 1 signed" : "Customer 1 blank", data.customer2 ? (data.signature2 ? "Customer 2 signed" : "Customer 2 blank") : null].filter(Boolean).join("; ");
-
+    const signatureText = [
+      data.signature1 ? "Customer 1 signed" : "Customer 1 blank - DocuSign",
+      data.customer2 ? (data.signature2 ? "Customer 2 signed" : "Customer 2 blank - DocuSign") : null
+    ].filter(Boolean).join("; ");
     $("reviewContent").innerHTML = `
-      <div class="review-block">
-        <h3>Order</h3>
-        <ul class="review-list">
-          <li><strong>Order #</strong><span>${escapeHtml(data.orderNumber)}</span></li>
-          <li><strong>Contract Date</strong><span>${escapeHtml(dateForPdf(data.contractDate))}</span></li>
-          <li><strong>Change Order Date</strong><span>${escapeHtml(data.changeOrderDate)}</span></li>
-          <li><strong>Customer</strong><span>${escapeHtml(data.customer1)}${data.customer2 ? ` &amp; ${escapeHtml(data.customer2)}` : ""}</span></li>
-          <li><strong>Installation Address</strong><span>${escapeHtml(data.installAddress)}</span></li>
-          <li><strong>Design Consultant</strong><span>${escapeHtml(data.consultant)}</span></li>
-        </ul>
+      <div class="review-block"><h3>Order</h3><ul class="review-list">
+        <li><strong>Order #</strong><span>${escapeHtml(data.orderNumber)}</span></li>
+        <li><strong>Contract Date</strong><span>${escapeHtml(dateForPdf(data.contractDate))}</span></li>
+        <li><strong>Change Order Date</strong><span>${escapeHtml(data.changeOrderDate)}</span></li>
+        <li><strong>Customer</strong><span>${escapeHtml(data.customer1)}${data.customer2 ? ` &amp; ${escapeHtml(data.customer2)}` : ""}</span></li>
+        <li><strong>Installation Address</strong><span>${escapeHtml(data.installAddress)}</span></li>
+        <li><strong>Design Consultant</strong><span>${escapeHtml(data.consultant)}</span></li>
+      </ul></div>
+      <div class="review-block"><h3>${data.changes.length} Project Change${data.changes.length === 1 ? "" : "s"}</h3>
+        ${data.changes.map((change, index) => `<div class="review-change"><strong>${index + 1}. Unit ${escapeHtml(change.unit)} - ${escapeHtml(change.room)}</strong><br>${escapeHtml(change.change)}</div>`).join("")}
       </div>
-      <div class="review-block">
-        <h3>${data.changes.length} Project Change${data.changes.length === 1 ? "" : "s"}</h3>
-        ${data.changes.map((c, i) => `<div class="review-change"><strong>${i+1}. Unit ${escapeHtml(c.unit)} - ${escapeHtml(c.room)}</strong><br>${escapeHtml(c.change)}</div>`).join("")}
-      </div>
-      <div class="review-block">
-        <h3>Pricing</h3>
-        <ul class="review-list">
-          <li><strong>Previous Project</strong><span class="review-money">${money(data.previousPrice)}</span></li>
-          <li><strong>Change Order</strong><span class="review-money ${data.changeAmount > 0 ? "positive" : data.changeAmount < 0 ? "negative" : ""}">${money(data.changeAmount, true)}</span></li>
-          <li><strong>New Project</strong><span class="review-money">${money(data.newPrice)}</span></li>
-          <li><strong>Out of Pocket</strong><span>${data.outOfPocket > 0 ? `${money(data.outOfPocket)} by ${data.oopMethod === "check" ? "Check" : "Credit Card"}` : "Fully financed ($0.00 out of pocket)"}</span></li>
-        </ul>
-      </div>
-      <div class="review-block">
-        <h3>Finance &amp; Approval</h3>
-        <ul class="review-list">
-          <li><strong>Finance</strong><span>${financeText}</span></li>
-          <li><strong>Signatures</strong><span>${escapeHtml(signatureText)}</span></li>
-        </ul>
-      </div>
-    `;
+      <div class="review-block"><h3>Pricing</h3><ul class="review-list">
+        <li><strong>Previous Project</strong><span class="review-money">${money(data.previousPrice)}</span></li>
+        <li><strong>Change Order</strong><span class="review-money ${data.changeAmount > 0 ? "positive" : data.changeAmount < 0 ? "negative" : ""}">${money(data.changeAmount, true)}</span></li>
+        <li><strong>New Project</strong><span class="review-money">${money(data.newPrice)}</span></li>
+        <li><strong>Out of Pocket</strong><span>${data.outOfPocket > 0 ? `${money(data.outOfPocket)} by ${data.oopMethod === "check" ? "Check" : "Credit Card"}` : "Fully financed ($0.00 out of pocket)"}</span></li>
+      </ul></div>
+      <div class="review-block"><h3>Finance &amp; Approval</h3><ul class="review-list">
+        <li><strong>Finance</strong><span>${financeText}</span></li>
+        <li><strong>Signatures</strong><span>${escapeHtml(signatureText)}</span></li>
+      </ul></div>`;
   }
 
   function setupSignaturePad(canvas) {
-    const ctx = canvas.getContext("2d");
-    ctx.lineWidth = 5;
-    ctx.lineCap = "round";
-    ctx.lineJoin = "round";
-    ctx.strokeStyle = "#111";
+    const context = canvas.getContext("2d");
+    context.lineWidth = 5;
+    context.lineCap = "round";
+    context.lineJoin = "round";
+    context.strokeStyle = "#111";
     let drawing = false;
     let last = null;
-
-    const point = (e) => {
-      const r = canvas.getBoundingClientRect();
-      const p = e.touches ? e.touches[0] : e;
-      return { x: (p.clientX - r.left) * (canvas.width / r.width), y: (p.clientY - r.top) * (canvas.height / r.height) };
+    const point = (event) => {
+      const rect = canvas.getBoundingClientRect();
+      return { x: (event.clientX - rect.left) * (canvas.width / rect.width), y: (event.clientY - rect.top) * (canvas.height / rect.height) };
     };
-    const start = (e) => { e.preventDefault(); drawing = true; last = point(e); };
-    const move = (e) => {
+    canvas.addEventListener("pointerdown", (event) => {
+      event.preventDefault();
+      canvas.setPointerCapture?.(event.pointerId);
+      drawing = true;
+      last = point(event);
+    });
+    canvas.addEventListener("pointermove", (event) => {
       if (!drawing) return;
-      e.preventDefault();
-      const p = point(e);
-      ctx.beginPath(); ctx.moveTo(last.x, last.y); ctx.lineTo(p.x, p.y); ctx.stroke(); last = p;
-    };
-    const end = (e) => { if (drawing) e.preventDefault(); drawing = false; last = null; };
-
-    canvas.addEventListener("pointerdown", start);
-    canvas.addEventListener("pointermove", move);
-    canvas.addEventListener("pointerup", end);
-    canvas.addEventListener("pointercancel", end);
-    canvas.addEventListener("pointerleave", end);
+      event.preventDefault();
+      const next = point(event);
+      context.beginPath(); context.moveTo(last.x, last.y); context.lineTo(next.x, next.y); context.stroke(); last = next;
+    });
+    const finish = () => { drawing = false; last = null; };
+    canvas.addEventListener("pointerup", finish);
+    canvas.addEventListener("pointercancel", finish);
+    canvas.addEventListener("pointerleave", finish);
   }
 
-  function clearCanvas(canvas) {
-    canvas.getContext("2d").clearRect(0, 0, canvas.width, canvas.height);
-  }
+  function clearCanvas(canvas) { canvas.getContext("2d").clearRect(0, 0, canvas.width, canvas.height); }
 
   function isCanvasBlank(canvas) {
     const pixels = canvas.getContext("2d").getImageData(0, 0, canvas.width, canvas.height).data;
-    for (let i = 3; i < pixels.length; i += 4) if (pixels[i] !== 0) return false;
+    for (let index = 3; index < pixels.length; index += 4) if (pixels[index] !== 0) return false;
     return true;
   }
 
-  function signatureDataUrl(canvas) {
-    return canvas.toDataURL("image/png");
+  function normalizeCanvasText(value) {
+    return String(value ?? "").replace(/[\u2018\u2019]/g, "'").replace(/[\u201C\u201D]/g, '"').replace(/[\u2013\u2014]/g, "-").replace(/\u2026/g, "...");
   }
 
-  function normalizePdfText(value) {
-    return String(value ?? "")
-      .replace(/[\u2018\u2019]/g, "'")
-      .replace(/[\u201C\u201D]/g, '"')
-      .replace(/[\u2013\u2014]/g, "-")
-      .replace(/\u2026/g, "...")
-      .replace(/[^\x20-\x7E\xA0-\xFF]/g, "");
+  function canvasRectFromPdfBox([x1, y1, x2, y2]) {
+    return { x: x1 * CANVAS_SCALE, y: (PDF_HEIGHT - y2) * CANVAS_SCALE, width: (x2 - x1) * CANVAS_SCALE, height: (y2 - y1) * CANVAS_SCALE };
   }
 
-  function drawTextInBox(page, text, box, font, maxSize = 9, minSize = 4.5, padding = 3, align = "left") {
-    const value = normalizePdfText(text);
+  function drawTextInBox(context, text, pdfBox, maxSize = 9, minSize = 4.5, padding = 3, align = "left") {
+    const value = normalizeCanvasText(text);
     if (!value) return;
-    const [x1, y1, x2, y2] = box;
-    const width = x2 - x1;
-    const height = y2 - y1;
-    const available = Math.max(8, width - padding * 2);
-    let size = maxSize;
-    while (size > minSize && font.widthOfTextAtSize(value, size) > available) size -= 0.25;
-    size = Math.max(minSize, size);
-    const textWidth = font.widthOfTextAtSize(value, size);
-    const textHeight = font.heightAtSize(size, { descender: false });
-    let x = x1 + padding;
-    if (align === "center") x = x1 + Math.max(padding, (width - textWidth) / 2);
-    if (align === "right") x = x2 - padding - textWidth;
-    const y = y1 + Math.max(1, (height - textHeight) / 2) + 0.5;
-    page.drawText(value, { x, y, size, font });
+    const rect = canvasRectFromPdfBox(pdfBox);
+    const horizontalPadding = padding * CANVAS_SCALE;
+    const available = Math.max(8, rect.width - horizontalPadding * 2);
+    let fontSize = maxSize * CANVAS_SCALE;
+    const minimumFontSize = minSize * CANVAS_SCALE;
+    context.fillStyle = "#000";
+    context.textBaseline = "middle";
+    context.textAlign = align;
+    while (fontSize > minimumFontSize) {
+      context.font = `${fontSize}px Arial, Helvetica, sans-serif`;
+      if (context.measureText(value).width <= available) break;
+      fontSize -= 1;
+    }
+    context.font = `${Math.max(minimumFontSize, fontSize)}px Arial, Helvetica, sans-serif`;
+    let x = rect.x + horizontalPadding;
+    if (align === "center") x = rect.x + rect.width / 2;
+    if (align === "right") x = rect.x + rect.width - horizontalPadding;
+    context.fillText(value, x, rect.y + rect.height / 2 + CANVAS_SCALE * 0.35, available);
   }
 
-  function centsForPdf(cents, signed = false) {
-    return money(cents, signed);
+  function drawSignature(context, sourceCanvas, pdfRect) {
+    context.drawImage(
+      sourceCanvas,
+      pdfRect.x * CANVAS_SCALE,
+      (PDF_HEIGHT - pdfRect.y - pdfRect.height) * CANVAS_SCALE,
+      pdfRect.width * CANVAS_SCALE,
+      pdfRect.height * CANVAS_SCALE
+    );
   }
 
-  async function generatePdf(data) {
-    if (!window.PDFLib) throw new Error("PDF library did not load. Check your internet connection and try again.");
-    const { PDFDocument, StandardFonts } = window.PDFLib;
-    const templateBytes = await fetch(TEMPLATE_PATH, { cache: "no-cache" }).then(r => {
-      if (!r.ok) throw new Error("Unable to load the Change Order PDF template.");
-      return r.arrayBuffer();
-    });
-    const pdfDoc = await PDFDocument.load(templateBytes);
-    const page = pdfDoc.getPages()[0];
-    const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
+  function drawPolicyNotice(context) {
+    const left = 42 * CANVAS_SCALE;
+    const top = (PDF_HEIGHT - 258) * CANVAS_SCALE;
+    const width = 330 * CANVAS_SCALE;
+    const height = 15 * CANVAS_SCALE;
+    context.fillStyle = "#fff";
+    context.fillRect(left, top, width, height);
+    context.fillStyle = "#000";
+    context.font = `${6.5 * CANVAS_SCALE}px Arial, Helvetica, sans-serif`;
+    context.textAlign = "left";
+    context.textBaseline = "middle";
+    context.fillText(
+      "More than 5 line items or a 10% change in price requires a new contract change order.",
+      left,
+      top + height / 2,
+      width
+    );
+  }
 
-    drawTextInBox(page, dateForPdf(data.contractDate), PDF_BOXES.contractDate, font, 9);
-    drawTextInBox(page, data.orderNumber, PDF_BOXES.orderNumber, font, 9);
-    drawTextInBox(page, data.changeOrderDate, PDF_BOXES.changeOrderDate, font, 9);
-    drawTextInBox(page, data.customer1, PDF_BOXES.customer1, font, 9);
-    drawTextInBox(page, data.customer2, PDF_BOXES.customer2, font, 9);
-    drawTextInBox(page, data.consultant, PDF_BOXES.consultant, font, 9);
-    drawTextInBox(page, data.installAddress, PDF_BOXES.installAddress, font, 8.5);
-
-    for (let i = 0; i < MAX_CHANGES; i++) {
-      const row = PDF_BOXES.changeRows[i];
-      const change = data.changes[i] || { unit: "", room: "", change: "" };
-      drawTextInBox(page, change.unit, row.unit, font, 8.5, 4.5, 2);
-      drawTextInBox(page, change.room, row.room, font, 8.5, 4.5, 2);
-      drawTextInBox(page, change.change, row.change, font, 8.0, 4.25, 2);
+  function loadTemplateImage() {
+    if (!templateImagePromise) {
+      templateImagePromise = new Promise((resolve, reject) => {
+        const image = new Image();
+        image.onload = () => resolve(image);
+        image.onerror = () => reject(new Error("Unable to load the Change Order image template."));
+        image.src = TEMPLATE_IMAGE_PATH;
+      });
     }
+    return templateImagePromise;
+  }
 
-    const financeProgramText = data.schedule.amountFinanced > 0
-      ? `${data.financeCode} - ${data.financeLabel.replace(" - ", " ")}`
-      : "";
-    drawTextInBox(page, financeProgramText, PDF_BOXES.financeProgram, font, 8, 4.5, 2);
-    drawTextInBox(page, data.schedule.amountFinanced > 0 ? data.financePlan : "", PDF_BOXES.financePlan, font, 8, 4.5, 2);
-
-    const s = data.schedule;
-    drawTextInBox(page, centsForPdf(s.deposit.check), PDF_BOXES.depositCheck, font, 8, 5, 2, "center");
-    drawTextInBox(page, centsForPdf(s.deposit.credit), PDF_BOXES.depositCredit, font, 8, 5, 2, "center");
-    drawTextInBox(page, centsForPdf(s.deposit.finance), PDF_BOXES.depositFinance, font, 8, 5, 2, "center");
-    drawTextInBox(page, centsForPdf(s.progress.check), PDF_BOXES.progressCheck, font, 8, 5, 2, "center");
-    drawTextInBox(page, centsForPdf(s.progress.credit), PDF_BOXES.progressCredit, font, 8, 5, 2, "center");
-    drawTextInBox(page, centsForPdf(s.progress.finance), PDF_BOXES.progressFinance, font, 8, 5, 2, "center");
-    drawTextInBox(page, centsForPdf(s.installation.check), PDF_BOXES.installationCheck, font, 8, 5, 2, "center");
-    drawTextInBox(page, centsForPdf(s.installation.credit), PDF_BOXES.installationCredit, font, 8, 5, 2, "center");
-    drawTextInBox(page, centsForPdf(s.installation.finance), PDF_BOXES.installationFinance, font, 8, 5, 2, "center");
-
-    drawTextInBox(page, centsForPdf(data.previousPrice), PDF_BOXES.previousPrice, font, 8.5, 5, 2, "center");
-    drawTextInBox(page, centsForPdf(data.changeAmount, true), PDF_BOXES.changeAmount, font, 8.5, 5, 2, "center");
-    drawTextInBox(page, centsForPdf(data.newPrice), PDF_BOXES.newPrice, font, 8.5, 5, 2, "center");
-
-    const sig1Present = data.signature1;
-    const sig2Present = data.signature2;
-    drawTextInBox(page, sig1Present ? data.changeOrderDate : "", PDF_BOXES.customer1Date, font, 8.5, 5, 2);
-    drawTextInBox(page, sig2Present ? data.changeOrderDate : "", PDF_BOXES.customer2Date, font, 8.5, 5, 2);
-    // Management signature/date intentionally remain blank.
-
-    if (sig1Present) {
-      const png = await pdfDoc.embedPng(signatureDataUrl($("signature1")));
-      const r = SIGNATURE_RECTS.signature1;
-      const scale = Math.min(r.width / png.width, r.height / png.height);
-      const w = png.width * scale, h = png.height * scale;
-      page.drawImage(png, { x: r.x + (r.width - w)/2, y: r.y + (r.height - h)/2, width: w, height: h });
+  async function renderChangeOrder(data) {
+    const templateImage = await loadTemplateImage();
+    const context = previewCanvas.getContext("2d", { alpha: false });
+    context.save();
+    context.clearRect(0, 0, MASTER_WIDTH, MASTER_HEIGHT);
+    context.drawImage(templateImage, 0, 0, MASTER_WIDTH, MASTER_HEIGHT);
+    drawPolicyNotice(context);
+    drawTextInBox(context, dateForPdf(data.contractDate), PDF_BOXES.contractDate, 9);
+    drawTextInBox(context, data.orderNumber, PDF_BOXES.orderNumber, 9);
+    drawTextInBox(context, data.changeOrderDate, PDF_BOXES.changeOrderDate, 9);
+    drawTextInBox(context, data.customer1, PDF_BOXES.customer1, 9);
+    drawTextInBox(context, data.customer2, PDF_BOXES.customer2, 9);
+    drawTextInBox(context, data.consultant, PDF_BOXES.consultant, 9);
+    drawTextInBox(context, data.installAddress, PDF_BOXES.installAddress, 8.5);
+    for (let index = 0; index < MAX_CHANGES; index += 1) {
+      const row = PDF_BOXES.changeRows[index];
+      const change = data.changes[index] || { unit: "", room: "", change: "" };
+      drawTextInBox(context, change.unit, row.unit, 8.5, 4.5, 2);
+      drawTextInBox(context, change.room, row.room, 8.5, 4.5, 2);
+      drawTextInBox(context, change.change, row.change, 8, 4.25, 2);
     }
-    if (sig2Present) {
-      const png = await pdfDoc.embedPng(signatureDataUrl($("signature2")));
-      const r = SIGNATURE_RECTS.signature2;
-      const scale = Math.min(r.width / png.width, r.height / png.height);
-      const w = png.width * scale, h = png.height * scale;
-      page.drawImage(png, { x: r.x + (r.width - w)/2, y: r.y + (r.height - h)/2, width: w, height: h });
+    const hasFinancing = data.schedule.amountFinanced > 0;
+    drawTextInBox(context, hasFinancing ? data.financeLabel : "", PDF_BOXES.financeProgram, 8, 4.5, 2);
+    drawTextInBox(context, hasFinancing ? data.financeCode : "", PDF_BOXES.financePlan, 8, 4.5, 2);
+    const schedule = data.schedule;
+    drawTextInBox(context, money(schedule.deposit.check), PDF_BOXES.depositCheck, 8, 5, 2, "center");
+    drawTextInBox(context, money(schedule.deposit.credit), PDF_BOXES.depositCredit, 8, 5, 2, "center");
+    drawTextInBox(context, money(schedule.deposit.finance), PDF_BOXES.depositFinance, 8, 5, 2, "center");
+    drawTextInBox(context, money(schedule.progress.check), PDF_BOXES.progressCheck, 8, 5, 2, "center");
+    drawTextInBox(context, money(schedule.progress.credit), PDF_BOXES.progressCredit, 8, 5, 2, "center");
+    drawTextInBox(context, money(schedule.progress.finance), PDF_BOXES.progressFinance, 8, 5, 2, "center");
+    drawTextInBox(context, money(schedule.installation.check), PDF_BOXES.installationCheck, 8, 5, 2, "center");
+    drawTextInBox(context, money(schedule.installation.credit), PDF_BOXES.installationCredit, 8, 5, 2, "center");
+    drawTextInBox(context, money(schedule.installation.finance), PDF_BOXES.installationFinance, 8, 5, 2, "center");
+    drawTextInBox(context, money(data.previousPrice), PDF_BOXES.previousPrice, 8.5, 5, 2, "center");
+    drawTextInBox(context, money(data.changeAmount, true), PDF_BOXES.changeAmount, 8.5, 5, 2, "center");
+    drawTextInBox(context, money(data.newPrice), PDF_BOXES.newPrice, 8.5, 5, 2, "center");
+    if (data.signature1) {
+      drawSignature(context, $("signature1"), SIGNATURE_RECTS.signature1);
+      drawTextInBox(context, data.changeOrderDate, PDF_BOXES.customer1Date, 8.5, 5, 2);
     }
+    if (data.signature2) {
+      drawSignature(context, $("signature2"), SIGNATURE_RECTS.signature2);
+      drawTextInBox(context, data.changeOrderDate, PDF_BOXES.customer2Date, 8.5, 5, 2);
+    }
+    // Management signature and date intentionally remain blank.
+    context.restore();
+    renderedData = data;
+  }
 
-    return await pdfDoc.save({ updateFieldAppearances: false });
+  function setPreviewScale(scale, label) {
+    previewScale = Math.max(0.1, Math.min(1, scale));
+    previewCanvas.style.width = `${Math.round(MASTER_WIDTH * previewScale)}px`;
+    previewCanvas.style.height = `${Math.round(MASTER_HEIGHT * previewScale)}px`;
+    $("zoomLabel").textContent = label || `${Math.round(previewScale * 100)}%`;
+  }
+
+  function fitPreview() {
+    const availableWidth = Math.max(280, previewViewport.clientWidth - 28);
+    setPreviewScale(Math.min(1, availableWidth / MASTER_WIDTH), "Fit");
+    previewViewport.scrollTo({ top: 0, left: 0 });
+  }
+
+  async function openPreview() {
+    if (isRendering) return;
+    isRendering = true;
+    const button = $("viewBtn");
+    button.disabled = true;
+    button.textContent = "Rendering...";
+    $("saveStatus").textContent = "Rendering...";
+    try {
+      await renderChangeOrder(getFormData());
+      reviewDialog.close();
+      previewDialog.showModal();
+      requestAnimationFrame(fitPreview);
+      $("saveStatus").textContent = "Preview ready";
+    } catch (error) {
+      console.error(error);
+      alert(error?.message || "Something went wrong while rendering the Change Order.");
+      $("saveStatus").textContent = "Error";
+    } finally {
+      isRendering = false;
+      button.disabled = false;
+      button.textContent = "View Change Order";
+    }
   }
 
   function safeFilenamePart(value) {
@@ -529,85 +529,82 @@
 
   function downloadBlob(blob, filename) {
     const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = filename;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = filename;
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
     setTimeout(() => URL.revokeObjectURL(url), 30000);
   }
 
-  async function handleGenerate() {
-    if (isGenerating) return;
-    isGenerating = true;
-    const button = $("generateBtn");
+  async function downloadPdf() {
+    if (isDownloading || !renderedData) return;
+    if (!window.PDFLib) { alert("PDF library did not load. Check your internet connection and try again."); return; }
+    isDownloading = true;
+    const button = $("downloadPdfBtn");
     button.disabled = true;
-    button.textContent = "Generating PDF...";
-    $("saveStatus").textContent = "Generating...";
+    button.textContent = "Creating PDF...";
+    $("saveStatus").textContent = "Creating PDF...";
     try {
-      const data = getFormData();
-      const pdfBytes = await generatePdf(data);
-      lastGeneratedBlob = new Blob([pdfBytes], { type: "application/pdf" });
-      const customer = safeFilenamePart(data.customer1.split(/\s+/).slice(-1)[0] || data.customer1);
-      const order = safeFilenamePart(data.orderNumber);
-      lastGeneratedFilename = `Change Order - ${customer} - ${order}.pdf`;
-      downloadBlob(lastGeneratedBlob, lastGeneratedFilename);
-      reviewDialog.close();
-      successDialog.showModal();
-      $("saveStatus").textContent = "PDF created";
-    } catch (err) {
-      console.error(err);
-      alert(err?.message || "Something went wrong while generating the PDF.");
+      const { PDFDocument } = window.PDFLib;
+      const pdfDocument = await PDFDocument.create();
+      pdfDocument.setTitle(`Change Order - ${renderedData.customer1}`);
+      pdfDocument.setCreator("Renewal by Andersen GLA Change Order Generator V3");
+      const page = pdfDocument.addPage([PDF_WIDTH, PDF_HEIGHT]);
+      const renderedImage = await pdfDocument.embedPng(previewCanvas.toDataURL("image/png"));
+      page.drawImage(renderedImage, { x: 0, y: 0, width: PDF_WIDTH, height: PDF_HEIGHT });
+      const pdfBytes = await pdfDocument.save({ useObjectStreams: true });
+      const customer = safeFilenamePart(renderedData.customer1.split(/\s+/).slice(-1)[0] || renderedData.customer1);
+      const order = safeFilenamePart(renderedData.orderNumber);
+      downloadBlob(new Blob([pdfBytes], { type: "application/pdf" }), `Change Order - ${customer} - ${order}.pdf`);
+      $("saveStatus").textContent = "PDF downloaded";
+    } catch (error) {
+      console.error(error);
+      alert(error?.message || "Something went wrong while creating the PDF.");
       $("saveStatus").textContent = "Error";
     } finally {
-      isGenerating = false;
+      isDownloading = false;
       button.disabled = false;
-      button.textContent = "Generate PDF";
+      button.textContent = "Download PDF";
     }
   }
 
-  function resetForNewOrder() {
-    const remembered = localStorage.getItem("changeorder_consultant") || "";
-    const shouldRemember = !!remembered;
+  function clearAllData() {
+    if (!window.confirm("Clear all entered Change Order data? This cannot be undone.")) return;
     formEl.reset();
+    localStorage.removeItem("changeorder_consultant");
     changes = [];
     addChange();
     clearCanvas($("signature1"));
     clearCanvas($("signature2"));
     $("changeOrderDate").value = todayForPdf();
-    $("consultant").value = remembered;
-    $("rememberConsultant").checked = shouldRemember;
-    lastGeneratedBlob = null;
     formError.classList.add("hidden");
-    successDialog.close();
+    renderedData = null;
+    if (reviewDialog.open) reviewDialog.close();
+    if (previewDialog.open) previewDialog.close();
     calculateLive();
+    $("saveStatus").textContent = "Ready";
     window.scrollTo({ top: 0, behavior: "smooth" });
   }
 
   function init() {
     $("changeOrderDate").value = todayForPdf();
     const savedConsultant = localStorage.getItem("changeorder_consultant");
-    if (savedConsultant) {
-      $("consultant").value = savedConsultant;
-      $("rememberConsultant").checked = true;
-    }
-
+    if (savedConsultant) { $("consultant").value = savedConsultant; $("rememberConsultant").checked = true; }
     setupSignaturePad($("signature1"));
     setupSignaturePad($("signature2"));
     addChange();
     calculateLive();
-
+    loadTemplateImage().catch(() => {});
     $("addChangeBtn").addEventListener("click", () => addChange());
-    changesList.addEventListener("input", (e) => syncChangeInput(e.target));
-    changesList.addEventListener("click", (e) => {
-      const btn = e.target.closest("[data-remove-change]");
-      if (btn) removeChange(btn.dataset.removeChange);
+    changesList.addEventListener("input", (event) => syncChangeInput(event.target));
+    changesList.addEventListener("click", (event) => {
+      const button = event.target.closest("[data-remove-change]");
+      if (button) removeChange(button.dataset.removeChange);
     });
-
-    ["previousPrice", "newPrice", "outOfPocket", "customer2"].forEach(id => $(id).addEventListener("input", calculateLive));
-    document.querySelectorAll('input[name="oopMethod"]').forEach(r => r.addEventListener("change", calculateLive));
-
+    ["previousPrice", "newPrice", "outOfPocket", "customer2"].forEach((id) => $(id).addEventListener("input", calculateLive));
+    document.querySelectorAll('input[name="oopMethod"]').forEach((radio) => radio.addEventListener("change", calculateLive));
     $("rememberConsultant").addEventListener("change", () => {
       if ($("rememberConsultant").checked && $("consultant").value.trim()) localStorage.setItem("changeorder_consultant", $("consultant").value.trim());
       else localStorage.removeItem("changeorder_consultant");
@@ -615,23 +612,27 @@
     $("consultant").addEventListener("input", () => {
       if ($("rememberConsultant").checked) localStorage.setItem("changeorder_consultant", $("consultant").value.trim());
     });
-
-    document.querySelectorAll("[data-clear-signature]").forEach(btn => btn.addEventListener("click", () => clearCanvas($(`signature${btn.dataset.clearSignature}`))));
-
+    document.querySelectorAll("[data-clear-signature]").forEach((button) => {
+      button.addEventListener("click", () => clearCanvas($(`signature${button.dataset.clearSignature}`)));
+    });
     $("reviewBtn").addEventListener("click", () => {
       if (!validateForm()) return;
-      const data = getFormData();
-      renderReview(data);
+      renderReview(getFormData());
       reviewDialog.showModal();
     });
     $("closeReviewBtn").addEventListener("click", () => reviewDialog.close());
     $("editBtn").addEventListener("click", () => reviewDialog.close());
-    $("generateBtn").addEventListener("click", handleGenerate);
-    $("downloadAgainBtn").addEventListener("click", () => { if (lastGeneratedBlob) downloadBlob(lastGeneratedBlob, lastGeneratedFilename); });
-    $("newOrderBtn").addEventListener("click", resetForNewOrder);
-
-    reviewDialog.addEventListener("click", e => { if (e.target === reviewDialog) reviewDialog.close(); });
-
+    $("viewBtn").addEventListener("click", openPreview);
+    $("closePreviewBtn").addEventListener("click", () => previewDialog.close());
+    $("backToReviewBtn").addEventListener("click", () => { previewDialog.close(); reviewDialog.showModal(); });
+    $("downloadPdfBtn").addEventListener("click", downloadPdf);
+    $("fitPreviewBtn").addEventListener("click", fitPreview);
+    $("zoomInBtn").addEventListener("click", () => setPreviewScale(previewScale * 1.25));
+    $("zoomOutBtn").addEventListener("click", () => setPreviewScale(previewScale / 1.25));
+    $("clearTopBtn").addEventListener("click", clearAllData);
+    $("clearBottomBtn").addEventListener("click", clearAllData);
+    reviewDialog.addEventListener("click", (event) => { if (event.target === reviewDialog) reviewDialog.close(); });
+    previewDialog.addEventListener("click", (event) => { if (event.target === previewDialog) previewDialog.close(); });
     if ("serviceWorker" in navigator) {
       window.addEventListener("load", () => navigator.serviceWorker.register(`sw.js?v=${BUILD_VERSION}`, { scope: "./" }).catch(() => {}));
     }
@@ -639,3 +640,4 @@
 
   init();
 })();
+
