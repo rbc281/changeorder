@@ -54,4 +54,3 @@ Expected GitHub Pages URL:
 - R412009 - 9.99% - 10 Years
 - R418006 - 6.99% - 15 Years
 - R418009 - 9.99% - 15 Years
-
